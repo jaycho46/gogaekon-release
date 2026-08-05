@@ -131,7 +131,10 @@ jobs:
           repository: jaycho46/gogaekon
           ref: ${{ steps.resolve.outputs.source_sha }}
           fetch-depth: 0
-          persist-credentials: false
+          # The prepare job fetches the release branch/tag again to prove that
+          # they still resolve to the requested SHA. Keep the deploy key until
+          # the checkout post-step removes it at the end of the job.
+          persist-credentials: true
           ssh-key: ${{ secrets.GOGAEKON_DEPLOY_KEY }}
 
       - uses: actions/setup-node@v6
