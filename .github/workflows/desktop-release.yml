@@ -1,0 +1,427 @@
+name: Desktop release build
+
+run-name: >-
+  Desktop ${{ github.event.action || inputs.mode }}
+  ${{ github.event.client_payload.tag || inputs.tag }}
+  @ ${{ github.event.client_payload.source_sha || inputs.source_sha }}
+
+on:
+  repository_dispatch:
+    types:
+      - desktop-release-validate
+      - desktop-release-publish
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '실행 모드'
+        required: true
+        type: choice
+        default: validate
+        options:
+          - validate
+          - publish
+      tag:
+        description: '릴리스 태그 (예: v0.2.0)'
+        required: true
+        type: string
+      source_branch:
+        description: '비공개 소스 브랜치 (예: release-0.2.0)'
+        required: true
+        type: string
+      source_sha:
+        description: '비공개 소스의 40자리 커밋 SHA'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    desktop-release-${{ github.event.action || inputs.mode }}-
+    ${{ github.event.client_payload.source_branch || inputs.source_branch }}-
+    ${{ github.event.client_payload.tag || inputs.tag }}
+  cancel-in-progress: ${{ github.event.action == 'desktop-release-validate' || inputs.mode == 'validate' }}
+
+jobs:
+  prepare:
+    name: Validate private source and prepare release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      source_branch: ${{ steps.resolve.outputs.source_branch }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+    steps:
+      - name: Resolve and validate request
+        id: resolve
+        shell: bash
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
+          PAYLOAD_SOURCE_BRANCH: ${{ github.event.client_payload.source_branch }}
+          PAYLOAD_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+          INPUT_MODE: ${{ inputs.mode }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_SOURCE_BRANCH: ${{ inputs.source_branch }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = 'repository_dispatch' ]; then
+            case "$EVENT_ACTION" in
+              desktop-release-validate) mode='validate' ;;
+              desktop-release-publish) mode='publish' ;;
+              *) echo "지원하지 않는 repository_dispatch 이벤트입니다: $EVENT_ACTION" >&2; exit 1 ;;
+            esac
+            tag="$PAYLOAD_TAG"
+            source_branch="$PAYLOAD_SOURCE_BRANCH"
+            source_sha="$PAYLOAD_SOURCE_SHA"
+          else
+            mode="$INPUT_MODE"
+            tag="$INPUT_TAG"
+            source_branch="$INPUT_SOURCE_BRANCH"
+            source_sha="$INPUT_SOURCE_SHA"
+          fi
+
+          case "$mode" in
+            validate|publish) ;;
+            *) echo "지원하지 않는 실행 모드입니다: $mode" >&2; exit 1 ;;
+          esac
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "릴리스 태그 형식이 올바르지 않습니다: $tag" >&2
+            exit 1
+          fi
+          if [[ ! "$source_branch" =~ ^release-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "릴리스 브랜치 형식이 올바르지 않습니다: $source_branch" >&2
+            exit 1
+          fi
+          if [[ ! "$source_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "소스 SHA 형식이 올바르지 않습니다: $source_sha" >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          if [ "$source_branch" != "release-$version" ]; then
+            echo "브랜치 $source_branch 와 태그 $tag 의 버전이 일치하지 않습니다." >&2
+            exit 1
+          fi
+
+          {
+            echo "mode=$mode"
+            echo "tag=$tag"
+            echo "source_branch=$source_branch"
+            echo "source_sha=$source_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Require private source deploy key
+        shell: bash
+        env:
+          GOGAEKON_DEPLOY_KEY: ${{ secrets.GOGAEKON_DEPLOY_KEY }}
+        run: |
+          if [ -z "$GOGAEKON_DEPLOY_KEY" ]; then
+            echo 'GOGAEKON_DEPLOY_KEY 저장소 시크릿이 필요합니다.' >&2
+            exit 1
+          fi
+
+      - name: Checkout exact private source commit
+        uses: actions/checkout@v4
+        with:
+          repository: jaycho46/gogaekon
+          ref: ${{ steps.resolve.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          ssh-key: ${{ secrets.GOGAEKON_DEPLOY_KEY }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.22.0
+
+      - name: Verify branch, tag, SHA, and package version
+        shell: bash
+        env:
+          MODE: ${{ steps.resolve.outputs.mode }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
+          SOURCE_BRANCH: ${{ steps.resolve.outputs.source_branch }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+        run: |
+          head_sha="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$head_sha" != "$SOURCE_SHA" ]; then
+            echo "체크아웃된 SHA $head_sha 가 요청 SHA $SOURCE_SHA 와 다릅니다." >&2
+            exit 1
+          fi
+
+          git fetch --force --no-tags origin \
+            "+refs/heads/${SOURCE_BRANCH}:refs/remotes/origin/${SOURCE_BRANCH}"
+          branch_sha="$(git rev-parse "refs/remotes/origin/${SOURCE_BRANCH}^{commit}")"
+          if [ "$branch_sha" != "$SOURCE_SHA" ]; then
+            echo "브랜치 HEAD $branch_sha 가 요청 SHA $SOURCE_SHA 와 다릅니다." >&2
+            exit 1
+          fi
+
+          if [ "$MODE" = 'publish' ]; then
+            git fetch --force origin "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            tag_sha="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [ "$tag_sha" != "$SOURCE_SHA" ]; then
+              echo "태그 대상 $tag_sha 가 요청 SHA $SOURCE_SHA 와 다릅니다." >&2
+              exit 1
+            fi
+          fi
+
+          node - <<'NODE'
+          const pkg = require('./apps/desktop/package.json')
+          const tag = process.env.RELEASE_TAG
+          const branch = process.env.SOURCE_BRANCH
+          const version = tag.slice(1)
+          if (pkg.version !== version) {
+            throw new Error(`데스크톱 버전 ${pkg.version}과 태그 ${tag}가 일치하지 않습니다`)
+          }
+          if (branch !== `release-${pkg.version}`) {
+            throw new Error(`브랜치 ${branch}와 데스크톱 버전 ${pkg.version}이 일치하지 않습니다`)
+          }
+          if (pkg.build?.artifactName !== 'crm-desktop-${version}-${os}-${arch}.${ext}') {
+            throw new Error('릴리스 artifactName은 ASCII 고정 패턴이어야 합니다')
+          }
+          const target = (pkg.build?.publish ?? []).find(
+            (entry) => entry.provider === 'github'
+          )
+          if (target?.owner !== 'jaycho46' || target?.repo !== 'gogaekon-release') {
+            throw new Error('Electron Builder 공개 대상 저장소가 올바르지 않습니다')
+          }
+          NODE
+
+      - name: Reset matching draft or create draft release
+        if: steps.resolve.outputs.mode == 'publish'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.tag }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source_sha }}
+        run: |
+          source_marker="<!-- gogaekon-source-sha: ${SOURCE_SHA} -->"
+          if release_is_draft="$(gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [ "$release_is_draft" != 'true' ]; then
+              echo '같은 버전의 공개 릴리스가 이미 존재합니다.' >&2
+              exit 1
+            fi
+            release_body="$(gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json body --jq '.body')"
+            if ! grep -Fq "$source_marker" <<<"$release_body"; then
+              echo '기존 draft가 다른 비공개 소스 SHA에서 생성되었습니다.' >&2
+              exit 1
+            fi
+            gh release delete "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --yes
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$RELEASE_REPOSITORY" \
+            --target main \
+            --draft \
+            --title "고객ON ${RELEASE_TAG#v}" \
+            --notes "$(printf '%s\n\n%s\n%s\n%s\n\n%s' \
+              "고객ON ${RELEASE_TAG#v} 업데이트입니다." \
+              '이 버전은 macOS와 Windows 코드 서명 없이 배포됩니다.' \
+              '- macOS에서는 확인되지 않은 개발자 경고가 표시될 수 있습니다.' \
+              '- Windows에서는 알 수 없는 게시자 또는 SmartScreen 경고가 표시될 수 있습니다.' \
+              "$source_marker")"
+
+  package:
+    name: Package ${{ matrix.name }}
+    needs: prepare
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            os: macos-15
+            platform: mac
+          - name: Windows x64
+            os: windows-2022
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - name: Checkout exact private source commit
+        uses: actions/checkout@v4
+        with:
+          repository: jaycho46/gogaekon
+          ref: ${{ needs.prepare.outputs.source_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          ssh-key: ${{ secrets.GOGAEKON_DEPLOY_KEY }}
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.22.0
+
+      - name: Install target-native dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck desktop
+        run: pnpm --filter crm-desktop run typecheck
+
+      - name: Test desktop
+        run: pnpm --filter crm-desktop run test
+
+      - name: Configure unsigned packaging
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('node:fs')
+          const path = 'apps/desktop/package.json'
+          const pkg = JSON.parse(fs.readFileSync(path, 'utf8'))
+          pkg.build.artifactName = 'crm-desktop-${version}-${os}-${arch}.${ext}'
+          pkg.build.mac.identity = null
+          pkg.build.mac.notarize = false
+          pkg.build.win.forceCodeSigning = false
+          pkg.build.win.verifyUpdateCodeSignature = false
+          fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`)
+          NODE
+
+      - name: Build unsigned installer
+        env:
+          GH_TOKEN: ${{ needs.prepare.outputs.mode == 'publish' && github.token || '' }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          CSC_LINK: ''
+          CSC_KEY_PASSWORD: ''
+          WIN_CSC_LINK: ''
+          WIN_CSC_KEY_PASSWORD: ''
+          MAIN_VITE_SYNC_SERVER_URL: https://api.gogaekon.com
+          RENDERER_VITE_KAKAO_JS_KEY: ${{ secrets.KAKAO_JS_KEY }}
+        run: >-
+          pnpm --filter crm-desktop run dist --publish
+          ${{ needs.prepare.outputs.mode == 'publish' && 'always' || 'never' }}
+
+      - name: Verify unsigned macOS app and update files
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          app_path="$(find apps/desktop/dist -maxdepth 2 -type d -name '*.app' -print -quit)"
+          if [ -z "$app_path" ]; then
+            echo '검증할 macOS 앱을 찾지 못했습니다.' >&2
+            exit 1
+          fi
+          if codesign --verify --deep --strict "$app_path" >/dev/null 2>&1; then
+            echo 'macOS 앱에 예상하지 않은 코드 서명이 있습니다.' >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          mac_base="apps/desktop/dist/crm-desktop-${version}-mac-arm64"
+          for expected in \
+            "${mac_base}.dmg" \
+            "${mac_base}.dmg.blockmap" \
+            "${mac_base}.zip" \
+            "${mac_base}.zip.blockmap" \
+            'apps/desktop/dist/latest-mac.yml'; do
+            if [ ! -f "$expected" ]; then
+              echo "필수 macOS 산출물이 없습니다: $expected" >&2
+              exit 1
+            fi
+          done
+          grep -F "path: crm-desktop-${version}-mac-arm64.zip" apps/desktop/dist/latest-mac.yml >/dev/null
+          grep -F "url: crm-desktop-${version}-mac-arm64.zip" apps/desktop/dist/latest-mac.yml >/dev/null
+          grep -F "url: crm-desktop-${version}-mac-arm64.dmg" apps/desktop/dist/latest-mac.yml >/dev/null
+          echo "무서명 macOS 앱과 업데이트 파일 확인: $app_path"
+
+      - name: Verify unsigned Windows installer and update files
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          $version = $env:RELEASE_TAG.Substring(1)
+          $base = "apps/desktop/dist/crm-desktop-$version-win-x64"
+          $required = @(
+            "$base.exe",
+            "$base.exe.blockmap",
+            'apps/desktop/dist/latest.yml'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "필수 Windows 산출물이 없습니다: $path"
+            }
+          }
+
+          $installer = Get-Item -LiteralPath "$base.exe"
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          if ($signature.Status -ne 'NotSigned') {
+            throw "Windows 설치 파일에 예상하지 않은 서명이 있습니다: $($signature.Status)"
+          }
+
+          $metadata = Get-Content -LiteralPath 'apps/desktop/dist/latest.yml' -Raw
+          if (-not $metadata.Contains("path: crm-desktop-$version-win-x64.exe")) {
+            throw 'latest.yml의 Windows 기본 경로가 올바르지 않습니다.'
+          }
+          if (-not $metadata.Contains("url: crm-desktop-$version-win-x64.exe")) {
+            throw 'latest.yml의 Windows URL이 올바르지 않습니다.'
+          }
+          Write-Host "무서명 Windows 설치 파일과 업데이트 파일 확인: $($installer.FullName)"
+
+  publish:
+    name: Verify and publish release
+    if: needs.prepare.outputs.mode == 'publish'
+    needs:
+      - prepare
+      - package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Verify updater assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json assets --jq '.assets[].name' > /tmp/assets.txt
+          version="${RELEASE_TAG#v}"
+          mac_base="crm-desktop-${version}-mac-arm64"
+          win_base="crm-desktop-${version}-win-x64"
+
+          printf '%s\n' \
+            "${mac_base}.dmg" \
+            "${mac_base}.dmg.blockmap" \
+            "${mac_base}.zip" \
+            "${mac_base}.zip.blockmap" \
+            "${win_base}.exe" \
+            "${win_base}.exe.blockmap" \
+            'latest-mac.yml' \
+            'latest.yml' | sort > /tmp/expected-assets.txt
+          sort /tmp/assets.txt > /tmp/actual-assets.txt
+          if ! diff -u /tmp/expected-assets.txt /tmp/actual-assets.txt; then
+            echo '릴리스 자산 구성이 예상과 다릅니다.' >&2
+            exit 1
+          fi
+          if LC_ALL=C grep -n '[^ -~]' /tmp/assets.txt; then
+            echo '릴리스 자산 이름은 ASCII만 사용할 수 있습니다.' >&2
+            exit 1
+          fi
+
+          mkdir -p /tmp/updater-metadata
+          gh release download "$RELEASE_TAG" \
+            --repo "$RELEASE_REPOSITORY" \
+            --pattern 'latest*.yml' \
+            --dir /tmp/updater-metadata
+          grep -F "path: ${mac_base}.zip" /tmp/updater-metadata/latest-mac.yml >/dev/null
+          grep -F "url: ${mac_base}.zip" /tmp/updater-metadata/latest-mac.yml >/dev/null
+          grep -F "url: ${mac_base}.dmg" /tmp/updater-metadata/latest-mac.yml >/dev/null
+          grep -F "path: ${win_base}.exe" /tmp/updater-metadata/latest.yml >/dev/null
+          grep -F "url: ${win_base}.exe" /tmp/updater-metadata/latest.yml >/dev/null
+
+      - name: Publish completed release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --draft=false --latest
