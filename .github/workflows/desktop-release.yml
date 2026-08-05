@@ -1,7 +1,7 @@
 name: Desktop release build
 
 run-name: >-
-  Desktop ${{ github.event.action || inputs.mode }}
+  Desktop ${{ github.event.action || 'desktop-release-validate' }}
   ${{ github.event.client_payload.tag || inputs.tag }}
   @ ${{ github.event.client_payload.source_sha || inputs.source_sha }}
 
@@ -12,14 +12,6 @@ on:
       - desktop-release-publish
   workflow_dispatch:
     inputs:
-      mode:
-        description: '실행 모드'
-        required: true
-        type: choice
-        default: validate
-        options:
-          - validate
-          - publish
       tag:
         description: '릴리스 태그 (예: v0.2.0)'
         required: true
@@ -38,10 +30,10 @@ permissions:
 
 concurrency:
   group: >-
-    desktop-release-${{ github.event.action || inputs.mode }}-
+    desktop-release-${{ github.event.action || 'desktop-release-validate' }}-
     ${{ github.event.client_payload.source_branch || inputs.source_branch }}-
     ${{ github.event.client_payload.tag || inputs.tag }}
-  cancel-in-progress: ${{ github.event.action == 'desktop-release-validate' || inputs.mode == 'validate' }}
+  cancel-in-progress: ${{ github.event.action != 'desktop-release-publish' }}
 
 jobs:
   prepare:
@@ -64,7 +56,6 @@ jobs:
           PAYLOAD_TAG: ${{ github.event.client_payload.tag }}
           PAYLOAD_SOURCE_BRANCH: ${{ github.event.client_payload.source_branch }}
           PAYLOAD_SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
-          INPUT_MODE: ${{ inputs.mode }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_SOURCE_BRANCH: ${{ inputs.source_branch }}
           INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
@@ -79,7 +70,9 @@ jobs:
             source_branch="$PAYLOAD_SOURCE_BRANCH"
             source_sha="$PAYLOAD_SOURCE_SHA"
           else
-            mode="$INPUT_MODE"
+            # 공개 저장소의 수동 실행은 dry-run만 허용한다. publish는 반드시
+            # 비공개 저장소에서 모든 검증을 마친 repository_dispatch로 요청한다.
+            mode='validate'
             tag="$INPUT_TAG"
             source_branch="$INPUT_SOURCE_BRANCH"
             source_sha="$INPUT_SOURCE_SHA"
